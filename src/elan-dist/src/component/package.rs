@@ -66,9 +66,17 @@ fn unpack_without_first_dir<R: Read>(archive: &mut tar::Archive<R>, path: &Path)
             let path = path.chain_err(|| ErrorKind::ExtractingPackage)?;
             path.into_owned()
         };
-        let full_path = path.join(strip_first_dir(&relpath)?);
-
+        let stripped = strip_first_dir(&relpath)?;
         let kind = entry.header().entry_type();
+        // An entry like `pkg` or `pkg/.` refers to the destination itself. Only a
+        // directory may be unpacked there: anything else would be created at
+        // `path`, and a symlink there would be resolved relative to the parent
+        // of `path`, letting later entries escape through it.
+        if stripped.as_os_str().is_empty() && !kind.is_dir() {
+            return Err(format!("invalid path in archive: '{}'", relpath.display()).into());
+        }
+        let full_path = path.join(stripped);
+
         if kind.is_hard_link() {
             return Err(
                 format!("unsupported hard link in archive: '{}'", relpath.display()).into(),
@@ -138,7 +146,12 @@ impl ZipPackage {
             if entry.name().ends_with('/') {
                 continue; // skip directories
             }
-            let full_path = path.join(strip_first_dir(Path::new(entry.name()))?);
+            let stripped = strip_first_dir(Path::new(entry.name()))?;
+            // A file entry like `pkg` would be written at the destination itself.
+            if stripped.as_os_str().is_empty() {
+                return Err(format!("invalid path in archive: '{}'", entry.name()).into());
+            }
+            let full_path = path.join(stripped);
 
             // Create the full path to the entry if it does not exist already
             match full_path.parent() {
@@ -222,6 +235,7 @@ mod tests {
     }
 
     enum TarEntry<'a> {
+        Dir(&'a str),
         File(&'a str),
         Symlink(&'a str, &'a str),
         Hardlink(&'a str, &'a str),
@@ -231,6 +245,12 @@ mod tests {
         let mut builder = tar::Builder::new(Vec::new());
         for entry in entries {
             match *entry {
+                TarEntry::Dir(path) => {
+                    let mut header = tar_header(tar::EntryType::Directory, path, 0);
+                    header.set_mode(0o755);
+                    header.set_cksum();
+                    builder.append(&header, io::empty()).unwrap();
+                }
                 TarEntry::File(path) => {
                     let header = tar_header(tar::EntryType::Regular, path, 2);
                     builder.append(&header, &b"hi"[..]).unwrap();
@@ -269,6 +289,7 @@ mod tests {
     #[test]
     fn tar_unpacks_normal_archive() {
         let (dir, result) = unpack_tar(&[
+            TarEntry::Dir("pkg/"),
             TarEntry::File("pkg/bin/lean"),
             TarEntry::File("pkg/lib/libfoo.so.1"),
             TarEntry::Symlink("pkg/lib/libfoo.so", "libfoo.so.1"),
@@ -321,6 +342,29 @@ mod tests {
     }
 
     #[test]
+    fn tar_rejects_symlink_at_destination() {
+        for path in ["pkg", "pkg/."] {
+            let (dir, result) =
+                unpack_tar(&[TarEntry::Symlink(path, "."), TarEntry::File("pkg/evil")]);
+            // On Unix, `symlink` would also fail on the `dest/` path that results
+            // from joining the empty path, so check that our own check fires.
+            let err = result.unwrap_err().to_string();
+            assert!(err.starts_with("invalid path in archive"), "{}: {}", path, err);
+            assert!(!dir.path().join("evil").exists(), "{}", path);
+        }
+    }
+
+    #[test]
+    fn tar_rejects_file_at_destination() {
+        for path in ["pkg", "pkg/."] {
+            let (dir, result) = unpack_tar(&[TarEntry::File(path)]);
+            let err = result.unwrap_err().to_string();
+            assert!(err.starts_with("invalid path in archive"), "{}: {}", path, err);
+            assert!(!dir.path().join("dest").is_file(), "{}", path);
+        }
+    }
+
+    #[test]
     fn tar_rejects_hard_link() {
         // Hard link targets are not relative to the destination but to the
         // working directory, which for tests contains `Cargo.toml`.
@@ -343,6 +387,15 @@ mod tests {
             let (dir, result) = unpack_zip(&[name]);
             assert!(result.is_err(), "{}", name);
             assert!(!dir.path().join("evil").exists());
+        }
+    }
+
+    #[test]
+    fn zip_rejects_file_at_destination() {
+        for name in ["pkg", "pkg/."] {
+            let (dir, result) = unpack_zip(&[name]);
+            assert!(result.is_err(), "{}", name);
+            assert!(!dir.path().join("dest").is_file(), "{}", name);
         }
     }
 
