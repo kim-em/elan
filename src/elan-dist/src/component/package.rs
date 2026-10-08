@@ -394,7 +394,8 @@ mod tests {
     fn zip_rejects_file_at_destination() {
         for name in ["pkg", "pkg/."] {
             let (dir, result) = unpack_zip(&[name]);
-            assert!(result.is_err(), "{}", name);
+            let err = result.unwrap_err().to_string();
+            assert!(err.starts_with("invalid path in archive"), "{}: {}", name, err);
             assert!(!dir.path().join("dest").is_file(), "{}", name);
         }
     }
